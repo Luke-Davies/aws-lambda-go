@@ -7,11 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"io/ioutil" // nolint:staticcheck
-	"reflect"
-	"strings"
 
 	"github.com/aws/aws-lambda-go/lambda/handlertrace"
 )
@@ -102,79 +99,7 @@ func WithEnableSIGTERM(callbacks ...func()) Option {
 	})
 }
 
-// handlerTakesContext returns whether the handler takes a context.Context as its first argument.
-func handlerTakesContext(handler reflect.Type) (bool, error) {
-	switch handler.NumIn() {
-	case 0:
-		return false, nil
-	case 1:
-		contextType := reflect.TypeOf((*context.Context)(nil)).Elem()
-		argumentType := handler.In(0)
-		if argumentType.Kind() != reflect.Interface {
-			return false, nil
-		}
-
-		// handlers like func(event any) are valid.
-		if argumentType.NumMethod() == 0 {
-			return false, nil
-		}
-
-		if !contextType.Implements(argumentType) || !argumentType.Implements(contextType) {
-			return false, fmt.Errorf("handler takes an interface, but it is not context.Context: %q", argumentType.Name())
-		}
-		return true, nil
-	case 2:
-		contextType := reflect.TypeOf((*context.Context)(nil)).Elem()
-		argumentType := handler.In(0)
-		if argumentType.Kind() != reflect.Interface || !contextType.Implements(argumentType) || !argumentType.Implements(contextType) {
-			return false, fmt.Errorf("handler takes two arguments, but the first is not Context. got %s", argumentType.Kind())
-		}
-		return true, nil
-	}
-	return false, fmt.Errorf("handlers may not take more than two arguments, but handler takes %d", handler.NumIn())
-}
-
-func validateReturns(handler reflect.Type) error {
-	errorType := reflect.TypeOf((*error)(nil)).Elem()
-
-	switch n := handler.NumOut(); {
-	case n > 2:
-		return fmt.Errorf("handler may not return more than two values")
-	case n > 1:
-		if !handler.Out(1).Implements(errorType) {
-			return fmt.Errorf("handler returns two values, but the second does not implement error")
-		}
-	case n == 1:
-		if !handler.Out(0).Implements(errorType) {
-			return fmt.Errorf("handler returns a single value, but it does not implement error")
-		}
-	}
-
-	return nil
-}
-
-// NewHandler creates a base lambda handler from the given handler function. The
-// returned Handler performs JSON serialization and deserialization, and
-// delegates to the input handler function. The handler function parameter must
-// satisfy the rules documented by Start. If handlerFunc is not a valid
-// handler, the returned Handler simply reports the validation error.
-func NewHandler(handlerFunc interface{}) Handler {
-	return NewHandlerWithOptions(handlerFunc)
-}
-
-// NewHandlerWithOptions creates a base lambda handler from the given handler function. The
-// returned Handler performs JSON serialization and deserialization, and
-// delegates to the input handler function. The handler function parameter must
-// satisfy the rules documented by Start. If handlerFunc is not a valid
-// handler, the returned Handler simply reports the validation error.
-func NewHandlerWithOptions(handlerFunc interface{}, options ...Option) Handler {
-	return newHandler(handlerFunc, options...)
-}
-
-func newHandler(handlerFunc interface{}, options ...Option) *handlerOptions {
-	if h, ok := handlerFunc.(*handlerOptions); ok {
-		return h
-	}
+func newHandler[TIn any, TOut any, H HandlerFunc[TIn, TOut]](handlerFunc H, options ...Option) *handlerOptions {
 	h := &handlerOptions{
 		baseContext:              context.Background(),
 		jsonResponseEscapeHTML:   false,
@@ -231,35 +156,9 @@ func (j *jsonOutBuffer) ContentType() string {
 	return contentTypeJSON
 }
 
-func reflectHandler(f interface{}, h *handlerOptions) handlerFunc {
+func reflectHandler[TIn any, TOut any, H HandlerFunc[TIn, TOut]](f H, h *handlerOptions) handlerFunc {
 	if f == nil {
 		return errorHandler(errors.New("handler is nil"))
-	}
-
-	// back-compat: types with reciever `Invoke(context.Context, []byte) ([]byte, error)` need the return bytes wrapped
-	if handler, ok := f.(Handler); ok {
-		return func(ctx context.Context, payload []byte) (io.Reader, error) {
-			b, err := handler.Invoke(ctx, payload)
-			if err != nil {
-				return nil, err
-			}
-			return bytes.NewBuffer(b), nil
-		}
-	}
-
-	handler := reflect.ValueOf(f)
-	handlerType := reflect.TypeOf(f)
-	if handlerType.Kind() != reflect.Func {
-		return errorHandler(fmt.Errorf("handler kind %s is not %s", handlerType.Kind(), reflect.Func))
-	}
-
-	takesContext, err := handlerTakesContext(handlerType)
-	if err != nil {
-		return errorHandler(err)
-	}
-
-	if err := validateReturns(handlerType); err != nil {
-		return errorHandler(err)
 	}
 
 	out := &jsonOutBuffer{bytes.NewBuffer(nil)}
@@ -273,55 +172,26 @@ func reflectHandler(f interface{}, h *handlerOptions) handlerFunc {
 
 		trace := handlertrace.FromContext(ctx)
 
-		// construct arguments
-		var args []reflect.Value
-		if takesContext {
-			args = append(args, reflect.ValueOf(ctx))
+		event := new(TIn)
+		if err := decoder.Decode(event); err != nil {
+			return nil, err
 		}
-		if (handlerType.NumIn() == 1 && !takesContext) || handlerType.NumIn() == 2 {
-			eventType := handlerType.In(handlerType.NumIn() - 1)
-			event := reflect.New(eventType)
-			if err := decoder.Decode(event.Interface()); err != nil {
-				return nil, err
-			}
-			if nil != trace.RequestEvent {
-				trace.RequestEvent(ctx, event.Elem().Interface())
-			}
-			args = append(args, event.Elem())
+		if nil != trace.RequestEvent {
+			trace.RequestEvent(ctx, event)
 		}
 
-		response := handler.Call(args)
-
-		// return the error, if any
-		if len(response) > 0 {
-			if errVal, ok := response[len(response)-1].Interface().(error); ok && errVal != nil {
-				return nil, errVal
-			}
-		}
-		// set the response value, if any
-		var val interface{}
-		if len(response) > 1 {
-			val = response[0].Interface()
-			if nil != trace.ResponseEvent {
-				trace.ResponseEvent(ctx, val)
-			}
-		}
-
-		// encode to JSON
-		if err := encoder.Encode(val); err != nil {
-			// if response is not JSON serializable, but the response type is a reader, return it as-is
-			if reader, ok := val.(io.Reader); ok {
-				return reader, nil
-			}
+		response, err := f(ctx, *event)
+		if err != nil {
 			return nil, err
 		}
 
-		// if response value is an io.Reader, return it as-is
-		if reader, ok := val.(io.Reader); ok {
-			// back-compat, don't return the reader if the value serialized to a non-empty json
-			if strings.HasPrefix(out.String(), "{}") {
-				return reader, nil
-			}
+		if nil != trace.ResponseEvent {
+			trace.ResponseEvent(ctx, response)
+		}
+
+		// encode to JSON
+		if err := encoder.Encode(response); err != nil {
+			return nil, err
 		}
 
 		// back-compat, strip the encoder's trailing newline unless WithSetIndent was used

@@ -28,9 +28,9 @@ func unixMS(ms int64) time.Time {
 }
 
 // startRuntimeAPILoop will return an error if handling a particular invoke resulted in a non-recoverable error
-func startRuntimeAPILoop(api string, handler Handler) error {
+func startRuntimeAPILoop(api string, handler *handlerOptions) error {
 	client := newRuntimeAPIClient(api)
-	h := newHandler(handler)
+	h := handler
 	for {
 		invoke, err := client.next()
 		if err != nil {

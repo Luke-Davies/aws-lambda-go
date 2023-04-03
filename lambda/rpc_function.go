@@ -32,7 +32,7 @@ func init() {
 	}}, startFunctions...)
 }
 
-func startFunctionRPC(port string, handler Handler) error {
+func startFunctionRPC(port string, handler *handlerOptions) error {
 	lis, err := net.Listen("tcp", "localhost:"+port)
 	if err != nil {
 		log.Fatal(err)
@@ -55,8 +55,8 @@ type Function struct {
 // NewFunction which creates a Function with a given Handler
 //
 // Deprecated: The Function type is public for the go1.x runtime internal use of the net/rpc package
-func NewFunction(handler Handler) *Function {
-	return &Function{newHandler(handler)}
+func NewFunction(handler *handlerOptions) *Function {
+	return &Function{handler}
 }
 
 // Ping method which given a PingRequest and a PingResponse parses the PingResponse
